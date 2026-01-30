@@ -1,0 +1,29 @@
+services:
+  freshclam:
+    image: clamav/clamav:1.4
+    environment:
+      - CLAMAV_NO_CLAMD=true
+      - CLAMAV_NO_FRESHCLAMD=true
+    command: freshclam -v
+    restart: "no"
+    volumes:
+      # Consider persisting ClamAV's database to minimize download time and traffic.
+      # Otherwise freshclam will download the whole bulk of CVD database at startup.
+      # mkdir -p local/lib local/log local/tmp
+      # chown -R 100:100 local
+      - ./local/lib:/var/lib/clamav
+      - ./local/log:/var/log/clamav
+      - ./local/tmp:/var/tmp
+  svc:
+    image: rntrp/reefspect:latest-nonfree
+    restart: "no"
+    user: "100" # clamav uses uid 100
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./local/lib:/var/lib/clamav
+      - ./local/log:/var/log/clamav
+      - ./local/tmp:/var/tmp
+    depends_on:
+      freshclam:
+        condition: service_completed_successfully
