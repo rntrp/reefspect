@@ -54,15 +54,13 @@ pub async fn shutdown(
     Extension(cfg): Extension<Arc<AppConfig>>,
     Extension(tx): Extension<Arc<ShutdownTx>>,
 ) -> StatusCode {
-    match cfg.enable_shutdown_endpoint {
-        false => StatusCode::NOT_FOUND,
-        true => {
-            let ptr = Arc::clone(&tx);
-            let mut lock = ptr.lock().await;
-            lock.take().map(|sender| sender.send(()));
-            StatusCode::ACCEPTED
-        }
+    if !cfg.enable_shutdown_endpoint {
+        return StatusCode::NOT_FOUND;
     }
+    if let Some(sender) = tx.lock().await.take() {
+        let _ = sender.send(());
+    }
+    StatusCode::ACCEPTED
 }
 
 pub async fn upload(
@@ -80,7 +78,8 @@ pub async fn upload(
         let mut md5 = md5::Md5::new();
         let mut sha256 = sha2::Sha256::new();
         while let Some(chunk) = field.chunk().await.map_err(map_mp_error_to_400)? {
-            size += tmp.write(&chunk).map_err(map_io_error_to_500)? as u64;
+            size += chunk.len() as u64;
+            tmp.write_all(&chunk).map_err(map_io_error_to_500)?;
             crc32.update(&chunk);
             md5.update(&chunk);
             sha256.update(&chunk);
@@ -92,7 +91,7 @@ pub async fn upload(
                 &field,
                 &tmp,
                 size,
-                format!("{:08x?}", crc32.finalize()),
+                format!("{:08x}", crc32.finalize()),
                 const_hex::encode(md5.finalize()),
                 const_hex::encode(sha256.finalize()),
             )
@@ -101,7 +100,7 @@ pub async fn upload(
         );
     }
     Ok(Json(AvResponse {
-        av_version: ctx.clamav_version.to_owned(),
+        av_version: ctx.clamav_version.clone(),
         db_version: ctx.db_version,
         db_sig_count: ctx.db_sig_count,
         db_date: ctx.db_date.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -119,7 +118,7 @@ async fn scan(
     md5: String,
     sha256: String,
 ) -> Result<AvResult, std::io::Error> {
-    let name = field.file_name().or(field.name()).map(|f| f.to_string());
+    let name = field.file_name().or(field.name()).map(str::to_owned);
     let path = tmp
         .path()
         .to_str()
@@ -132,7 +131,7 @@ async fn scan(
         .scan(target, Some(path), settings)
         .map_err(|err| std::io::Error::other(err))?;
     let r = poll_result(&mut stream).await?;
-    return Ok(AvResult {
+    Ok(AvResult {
         name,
         size,
         crc32,
@@ -146,21 +145,21 @@ async fn scan(
             clamav_async::engine::ScanResult::Virus(_) => "VIRUS",
         },
         signature: match r {
-            clamav_async::engine::ScanResult::Clean => None,
-            clamav_async::engine::ScanResult::Whitelisted => None,
             clamav_async::engine::ScanResult::Virus(sig) => Some(sig.to_owned()),
+            _ => None,
         },
-    });
+    })
 }
 
 #[inline]
 async fn detect_type(path: &str) -> Result<Option<&'static str>, std::io::Error> {
     const LIMIT: u64 = 8192;
     let file = File::open(path).await?;
-    let size = std::cmp::min(LIMIT, file.metadata().await?.size());
+    let meta = file.metadata().await?;
+    let size = meta.size().min(LIMIT);
     let mut buf = Vec::with_capacity(size as usize);
     file.take(LIMIT).read_to_end(&mut buf).await?;
-    Ok(infer::get(buf.as_slice()).map(|t| t.mime_type()))
+    Ok(infer::get(&buf).map(|t| t.mime_type()))
 }
 
 #[inline]
@@ -168,14 +167,11 @@ async fn poll_result(
     rs: &mut ReceiverStream<clamav_async::engine::ScanEvent>,
 ) -> Result<clamav_async::engine::ScanResult, std::io::Error> {
     while let Some(event) = rs.next().await {
-        match event {
-            clamav_async::engine::ScanEvent::Result(r) => {
-                return r.map_err(|err| std::io::Error::other(err));
-            }
-            _ => continue,
+        if let clamav_async::engine::ScanEvent::Result(result) = event {
+            return result.map_err(std::io::Error::other);
         }
     }
-    return Err(std::io::Error::other("Could not retrieve scan result"));
+    Err(std::io::Error::other("Could not retrieve scan result"))
 }
 
 #[inline]
